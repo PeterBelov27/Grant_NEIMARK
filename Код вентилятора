@@ -1,0 +1,312 @@
+/*
+   Алгоритм работы системы:
+   1. Сервопривод сканирует пространство от MIN_ANGLE до MAX_ANGLE
+   2. При калибровке создается "карта" расстояний
+   3. В режиме поиска (SEEK) система ищет отклонения от калибровочных значений
+   4. При обнаружении цели переходит в режим удержания (HOLD)
+   5. Управление вентилятором осуществляется PID-регулятором, стремящимся к 24°C
+*/
+
+// ------------- НАСТРОЙКИ --------------
+#define STEP_DELAY 30       // скорость серво (минимально 5 мс)
+#define TIMEOUT 2000        // таймаут потери цели в режиме HOLD
+#define PWR_TIMEOUT 15000   // таймаут перехода в режим ожидания
+#define MAX_ANGLE 150       // максимальный угол поворота серво
+#define MIN_ANGLE 10        // минимальный угол поворота серво
+#define DIST_MAX 60         // максимальное расстояние для сонара (см)
+
+#define DEADZONE 20         // зона нечувствительности (разность с калибровкой)
+#define MIN_CATCH 5         // минимальное количество точек для обнаружения цели
+#define MISTAKES 2          // допустимое количество пропусков при сканировании
+#define TARGET_TEMP 24.0    // желаемая температура (PID будет стремиться к ней)
+// ------------- НАСТРОЙКИ --------------
+
+// ---------- ПИНЫ ----------
+#define ECHO 5
+#define TRIG 4
+#define SERVO 3
+#define MOS 2               // ШИМ пин для вентилятора
+#define DHTPIN 6            // Пин для датчика DHT11
+// ---------- ПИНЫ ----------
+
+#include <Servo.h>
+#include "GyverHacks.h"
+#include <NewPing.h>
+#include <DHT.h>
+
+// ---------- ОБЪЕКТЫ И ПЕРЕМЕННЫЕ ----------
+Servo servo;
+GTimer stepTimer(STEP_DELAY);
+GTimer sonarTimer(100);
+GTimer timeoutTimer(TIMEOUT);
+GTimer powerTimer(PWR_TIMEOUT);
+GTimer wakeTimer(2000);
+GTimer dhtTimer(2000);      // Таймер для опроса DHT (не чаще 2 сек)
+
+NewPing sonar(TRIG, ECHO, DIST_MAX);
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// Режимы работы
+typedef enum {SEEK, HOLD, WAIT};
+byte mode = SEEK;
+
+// Переменные для серво и сканирования
+boolean direct = true;
+boolean next = false;
+int angle = MIN_ANGLE;
+const byte steps_num = (MAX_ANGLE - MIN_ANGLE) / 2;
+int distance[steps_num + 1];
+
+// Переменные для обнаружения цели
+boolean catch_flag = false, catched_flag = false, hold_flag = false, wait_flag = false;
+byte catch_num = 0;
+byte mistakes = 0;
+byte catch_pos = 0;
+
+// PID-регулятор
+float temperature = 0;
+float fanPower = 0;         // Мощность вентилятора (0-100%)
+float lastError = 0;
+float integral = 0;
+
+// Коэффициенты PID (подобраны экспериментально)
+const float Kp = 10.0;     // Пропорциональный коэффициент
+const float Ki = 0.1;       // Интегральный коэффициент
+const float Kd = 1.0;       // Дифференциальный коэффициент
+// ---------- ОБЪЕКТЫ И ПЕРЕМЕННЫЕ ----------
+
+void setup() {
+  Serial.begin(115200);
+  servo.attach(SERVO);
+  servo.write(MIN_ANGLE);
+  pinMode(MOS, OUTPUT);
+  digitalWrite(MOS, 0);
+  dht.begin();
+  
+  delay(1000);            // Ожидание установки серво
+  calibration();          // Калибровка дальномера
+  powerTimer.reset();     // Сброс таймера ожидания
+}
+
+void loop() {
+  readDHT();              // Чтение температуры и обновление PID
+  updateFanPID();         // Расчет и установка мощности вентилятора
+  
+  switch (mode) {
+    case SEEK: seek();    // Режим поиска цели
+      break;
+    case HOLD: hold();    // Режим удержания цели
+      break;
+    case WAIT: wait();    // Режим ожидания
+      break;
+  }
+  
+  printDebugData();       // Вывод данных для мониторинга
+}
+
+// Чтение температуры с DHT11
+void readDHT() {
+  if (dhtTimer.isReady()) {
+    float newTemp = dht.readTemperature();
+    if (!isnan(newTemp)) {
+      temperature = newTemp;
+    }
+  }
+}
+
+// PID-регулятор для управления вентилятором
+void updateFanPID() {
+  float error = temperature - TARGET_TEMP;  // Ошибка (разность с целевой температурой)
+  
+  // Пропорциональная составляющая
+  float P = Kp * error;
+  
+  // Интегральная составляющая (сумма ошибок)
+  integral += error;
+  float I = Ki * integral;
+  
+  // Дифференциальная составляющая (изменение ошибки)
+  float D = Kd * (error - lastError);
+  lastError = error;
+  
+  // Суммируем все составляющие
+  float output = P + I + D;
+  
+  // Ограничиваем выходное значение от 0 до 100%
+  fanPower = constrain(output, 0, 100);
+  
+  // Устанавливаем мощность вентилятора
+  setFanPower(fanPower);
+}
+
+// Установка мощности вентилятора
+void setFanPower(int power) {
+  power = constrain(power, 0, 100);
+  if (power == 0) {
+    digitalWrite(MOS, 0);
+  } else if (power == 100) {
+    digitalWrite(MOS, 1);
+  } else {
+    analogWrite(MOS, map(power, 0, 100, 0, 255));
+  }
+}
+
+// Режим ожидания
+void wait() {
+  if (!wait_flag) {
+    turn_to((MAX_ANGLE - MIN_ANGLE) / 2);  // Центрируем серво
+    setFanPower(0);                        // Выключаем вентилятор
+    wait_flag = true;
+  }
+  
+  // Проверка приближения руки для выхода из режима ожидания
+  if (sonarTimer.isReady()) {
+    int curr_dist = sonar.ping_cm();
+    if (curr_dist > 1 && curr_dist < 10) {
+      if (wakeTimer.isReady()) {
+        mode = SEEK;
+        wait_flag = false;
+        powerTimer.reset();
+        delay(2000);  // Задержка перед началом сканирования
+      }
+    } else {
+      wakeTimer.reset();
+    }
+  }
+}
+
+// Режим поиска цели
+void seek() {
+  // Движение серво вперед-назад
+  if (direct) {
+    if (angle < MAX_ANGLE) turn_to(MAX_ANGLE);
+    else {
+      direct = false;
+      delay(50);
+    }
+  } else {
+    if (angle > MIN_ANGLE) turn_to(MIN_ANGLE);
+    else {
+      direct = true;
+      delay(50);
+    }
+  }
+  
+  search();  // Поиск цели
+}
+
+// Режим удержания цели
+void hold() {
+  if (!hold_flag) {
+    turn_to(catch_pos);  // Поворот к центру цели
+  } else {
+    if (sonarTimer.isReady()) {
+      byte pos = (angle - MIN_ANGLE) / 2;
+      int curr_dist = sonar.ping_cm();
+      if (curr_dist == 0) curr_dist = DIST_MAX;
+      int diff = distance[pos] - curr_dist;
+      
+      // Проверка на потерю цели
+      if ((diff < DEADZONE) || (curr_dist > 1 && curr_dist < 10)) {
+        if (timeoutTimer.isReady()) {
+          mode = SEEK;
+          hold_flag = false;
+          powerTimer.reset();
+        }
+      } else {
+        timeoutTimer.reset();
+      }
+    }
+  }
+}
+
+// Поиск цели при сканировании
+void search() {
+  if (angle % 2 == 0 && next) {
+    if (powerTimer.isReady()) {
+      mode = WAIT;
+      wait_flag = false;
+    }
+    next = false;
+    
+    byte pos = (angle - MIN_ANGLE) / 2;
+    int curr_dist = sonar.ping_cm();
+    if (curr_dist == 0) curr_dist = DIST_MAX;
+    int diff = distance[pos] - curr_dist;
+    
+    if (diff > DEADZONE) {
+      if (!catch_flag) {
+        catch_flag = true;
+        catch_pos = angle;
+      }
+      catch_num++;
+      if (catch_num > MIN_CATCH) catched_flag = true;
+    } else {
+      if (catch_flag) {
+        if (mistakes > MISTAKES) {
+          catch_flag = false;
+          catched_flag = false;
+          catch_num = 0;
+          mistakes = 0;
+        } else {
+          mistakes++;
+        }
+      }
+
+      if (catched_flag) {
+        mode = HOLD;
+        if (direct) catch_pos += catch_num;
+        else catch_pos -= catch_num;
+        
+        hold_flag = false;
+        catch_flag = false;
+        catched_flag = false;
+        catch_num = 0;
+        mistakes = 0;
+      }
+    }
+  }
+}
+
+// Калибровка дальномера
+void calibration() {
+  for (angle = MIN_ANGLE; angle <= MAX_ANGLE; angle++) {
+    servo.write(angle);
+    if (angle % 2 == 0) {
+      byte pos = (angle - MIN_ANGLE) / 2;
+      int curr_dist = sonar.ping_cm();
+      if (curr_dist == 0) distance[pos] = DIST_MAX;
+      else distance[pos] = curr_dist;
+    }
+    delay(STEP_DELAY * 1.5);
+  }
+}
+
+// Плавный поворот серво
+void turn_to(byte to_angle) {
+  if (stepTimer.isReady()) {
+    if (angle < to_angle) angle++;
+    else if (angle > to_angle) angle--;
+    else {
+      hold_flag = true;
+      wait_flag = true;
+    }
+    servo.write(angle);
+    next = true;
+  }
+}
+
+// Вывод отладочной информации. Чтобы увидеть график в Arduino IDE нажимаем комбинацию клавиш Ctrl+Shift+L
+void printDebugData() {
+  Serial.print("Angle:");
+  Serial.print(angle);
+  Serial.print(" Distance:");
+  byte pos = (angle - MIN_ANGLE) / 2;
+  Serial.print(distance[pos]);
+  Serial.print(" Temperature:");
+  Serial.print(temperature);
+  Serial.print(" FanPower:");
+  Serial.print(fanPower);
+  Serial.println();
+}
